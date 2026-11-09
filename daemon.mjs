@@ -2365,7 +2365,7 @@ export async function startDaemon(opts = {}) {
     every(1000, watchJobTick)
   }
 
-  log(`守护进程就绪：http://${host}:${port}（state: ${stateDir}）`)
+  log(`${requireKey ? "引擎" : "守护进程"}就绪：http://${host}:${port}（state: ${stateDir}）`)
   // A：绑定为通配地址时必须给出明确提示（与 index.mjs / reachableHint 同一句口径）
   const bindWarn = bindHint(host)
   if (bindWarn) log(`监听 ${host}:${port}：${bindWarn}`)
