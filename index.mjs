@@ -20,6 +20,7 @@
 // tool 钩子在，magpie 照样会为工具启动插件宿主并调用本入口，ensureDaemon 因此
 // 照常运行；页面入口卡也照常出现。
 
+import crypto from "node:crypto"
 import { dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 import {
@@ -38,8 +39,9 @@ import {
   stateDirFor,
   writeControl,
 } from "./lifecycle.mjs"
+import { startDaemon } from "./daemon.mjs"
 
-const VERSION = "0.3.2"
+const VERSION = "0.4.0"
 const TOOL_PREFIX = "workbuddy_tasks" // 契约 §6 的工具名前缀（magpie 还会加上插件短名前缀）
 
 // 本文件自己的目录（daemon.mjs 与它同目录）
@@ -179,41 +181,63 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
     } catch {}
   }
 
-  // 用户在 plugins.json options 里可写 dashboardUrl（给 page 入口卡跳转看板用）
-  const dashboardUrl = typeof options?.dashboardUrl === "string" ? options.dashboardUrl : ""
-  // Docker 里容器内回环外部不可达：options.listenAddress 可写 "0.0.0.0"（只到容器网桥）
-  const listenAddress = typeof options?.listenAddress === "string" ? options.listenAddress.trim() : ""
-
-  // 拉起守护进程（不阻塞插件加载太久：ensureDaemon 自带 8s 预算，失败也不炸）
-  // A：就绪日志打印真实绑定地址（daemon.json 的 host，由 daemon 心跳写入），
-  // 绑定 0.0.0.0/:: 时补一句与 daemon 启动日志 / reachableHint 相同口径的提示。
-  const boot = ensureDaemon({ cfgDir, pluginDir: dir, log, addr: listenAddress })
-    .then((r) => {
-      if (r?.error) log("守护进程：" + r.error)
-      else if (r?.info) {
-        const bindHost = r.info.host || "127.0.0.1"
-        log(`守护进程就绪：${bindHost}:${r.info.port}${r.spawned ? "（本次拉起）" : "（复用已有）"}`)
-        const hint = bindHint(bindHost)
-        if (hint) log(`监听 ${bindHost}:${r.info.port}：${hint}`)
-      }
-      return r
-    })
-    .catch((e) => ({ info: null, spawned: false, error: short(e) }))
-
-  // 宿主退出：只有本会话拉起的守护进程才由我们送行；其余交给它自己的 magpie 探测
-  registerExitHooks(async () => {
-    const r = await boot.catch(() => null)
-    if (r?.spawned && r?.info) await shutdownDaemon(r.info)
+  // 引擎跑在 magpie 的插件宿主里：不再有独立的 4390 守护进程、spawn 或
+  // daemon.json 生命周期。startDaemon 仍复用它的 HTTP 路由（工具和页面都
+  // 打这个进程内的回环端口），但只绑 127.0.0.1 的随机端口，随宿主退出。
+  // 排程/心跳定时器不启动；只手动驱动 job 的收尾（watchJob），避免它自己
+  // 探测 magpie 或读写 control.json 而误退。
+  let runtime = null
+  let runtimeTimer = null
+  let schedTimer = null
+  const boot = (async () => {
+    try {
+      runtime = await startDaemon({
+        cfgDir,
+        stateDir,
+        port: 0,
+        managed: false,
+        skipExistingCheck: true,
+        noTimers: true,
+        // 只存在内存里的 key：随机端口上的 /api 不接受无 key 的本地进程
+        key: crypto.randomBytes(24).toString("base64url"),
+        requireKey: true,
+        noInfo: true,
+        log,
+      })
+      runtimeTimer = setInterval(() => { try { runtime?.ticks?.watchJob?.() } catch {} }, 1000)
+      runtimeTimer?.unref?.()
+      // 小时排程仍要跑，但只驱动排程检查；不跑 magpie/control 探测，避免
+      // 宿主进程内被误判为“magpie 不在了”而退出。
+      schedTimer = setInterval(() => { try { runtime?.ticks?.checkScheduler?.() } catch {} }, 30000)
+      schedTimer?.unref?.()
+      const info = { host: runtime.host || "127.0.0.1", port: runtime.port, key: runtime.key }
+      log(`引擎就绪（进程内）：${info.host}:${info.port}`)
+      return { info, spawned: false }
+    } catch (e) {
+      log("引擎启动失败：" + short(e))
+      return { info: null, spawned: false, error: short(e) }
+    }
+  })()
+  process.once("exit", () => {
+    clearInterval(runtimeTimer)
+    clearInterval(schedTimer)
+    try { runtime?.stop?.() } catch {}
   })
 
-  const client = makeDaemonClient(async () => {
-    const r = await boot
-    if (r?.info) return r.info
-    // 第一次没起来，给一次快速重试的机会
-    const retry = await ensureDaemon({ cfgDir, pluginDir: dir, log, budgetMs: 3000, addr: listenAddress }).catch(() => null)
-    if (retry?.info) return retry.info
-    return null
-  })
+  const client = makeDaemonClient(async () => (await boot)?.info || null)
+
+  // 页面动作与工具走同一个进程内引擎；HTTP 只是模块边界，不是独立服务。
+  const call = async (method, path, body, ms = 15000) => {
+    const r = await client.call(method, path, body, ms)
+    if (!r.ok) throw new Error(r.data?.error || `HTTP ${r.status}`)
+    return r.data
+  }
+  // the page does not need the internal port; never hand it out
+  const cleanState = (s) => {
+    if (!s || typeof s !== "object") return s
+    const { port, host, bindHost, serveUrl, reachableHint, ...rest } = s
+    return rest
+  }
 
   // ---- tool 钩子（契约 §6） ----
   // SDK（@opencode-ai/plugin）由 magpie 的插件宿主提供；拿不到时跳过工具注册，
@@ -371,7 +395,22 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
   // 本插件只声明 tool 钩子（契约 §5：不声明 provider，避免 magpie 在供应商卡里
   // 显示「未登录」与无意义的登录按钮；magpie.page + tool 已足够让 magpie 加载
   // 本插件并启动插件宿主——入口函数被执行时 ensureDaemon 生命周期照常运转）。
-  const hooks = {}
+  const hooks = {
+    page: {
+      actions: {
+        status: async () => cleanState(await call("GET", "/api/state", undefined, 15000)),
+        run: (args = {}) => call("POST", "/api/run", args, 15000),
+        job: async (args = {}) => {
+          if (args.id) return call("GET", `/api/jobs/${encodeURIComponent(String(args.id))}`, undefined, 10000)
+          return (await call("GET", "/api/state", undefined, 10000)).job ?? null
+        },
+        cancel: () => call("POST", "/api/stop", {}, 10000),
+        claim: (args = {}) => call("POST", "/api/task/claim", { uid: args.uid, code: args.code }, 30000),
+        settings: (args = {}) => call("POST", "/api/settings", args, 10000),
+        refresh: async () => cleanState(await call("GET", "/api/state?refresh=1", undefined, 30000)),
+      },
+    },
+  }
   if (toolHook) hooks.tool = toolHook
 
   return hooks

@@ -4,13 +4,20 @@
 
 - 仓库：<https://github.com/jichie/magpie-workbuddy-tasks>
 - 安装：`magpie plugin add github:jichie/magpie-workbuddy-tasks`
-- 当前版本：**0.3.2**（[更新日志](./CHANGELOG.md)）
+- 当前版本：**0.4.0**（[更新日志](./CHANGELOG.md)）
 - 只服务国内版 `workbuddy` 账号；国际版 `workbuddy-ai` 不会出现在插件里。
+
+> **0.4.0：不再有 4390 守护进程。** 引擎在 magpie 的插件宿主里运行，
+> 页面直接通过 `magpie.invoke` 调 `status / run / job / cancel / claim /
+> settings / refresh`；没有独立进程、没有独立看板地址、没有对外端口。
+> 进程内的回环 API 只绑 `127.0.0.1` 的随机端口，并要求只存在内存里的
+> Bearer key；下文中 `dashboardUrl`/`listenAddress`、`daemon.mjs` 手动
+> 启动和 4390 隧道等段落仅描述 0.3.x 的历史行为。
 
 ## 快速开始
 
 1. 在已登录 WorkBuddy 国内版的 magpie 上执行 `magpie plugin add github:jichie/magpie-workbuddy-tasks`，并在插件管理里启用。
-2. 打开「WorkBuddy 任务」入口卡，进入看板；首次加载会读取账号与任务快照。
+2. 打开侧栏「WorkBuddy 任务」页；首次加载会读取账号与任务快照。
 3. 排程默认是关的。想手动跑：勾选账号和任务腿，点「批量做任务」；只想接取/领奖就用对应按钮。
 4. 任务明细里可勾选任务，批量操作只做选中的；积分列会显示余额，点「明细」看套餐权益包。
 5. **可选**：已有账号 JSON（hub / 旧机器 / 桌面端）？看板「导入 / 导出」→ 预览 → 确认，账号会合并进 magpie 的凭据库，magpie 和社区 WorkBuddy 插件都能直接使用。

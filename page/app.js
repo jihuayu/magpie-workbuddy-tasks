@@ -1,288 +1,178 @@
-// magpie 沙箱页（入口卡）逻辑。
-//
-// 硬约束（宿主沙箱）：iframe sandbox="allow-scripts"、CSP connect-src 'none' ——
-// 没有 fetch / WebSocket / EventSource，没有内联脚本。本文件零网络请求。
-// package.json 的 magpie.permissions 是空数组 → 不调用 magpie.read（连
-// 'providers:list' 也不调），账号信息只做静态说明。
-// 可用的宿主 API（按防御式写法消费，形状不确定时全部静默降级）：
-//   magpie.ready / magpie.theme / magpie.onTheme / magpie.options.get() / magpie.onAction
-// 主题：跟随宿主 data-theme；本卡的增量样式（style.css）与看板同一套 token。
-(function () {
-  "use strict";
+"use strict";
 
-  var DEFAULT_URL = "http://127.0.0.1:4390";
-  var DASH_PORT = "4390";
+const $ = (id) => document.getElementById(id);
+const api = () => window.magpie;
 
-  function $(sel) {
-    return document.querySelector(sel);
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+
+function say(text, bad = false) {
+  const m = $("msg");
+  m.hidden = !text;
+  m.textContent = text || "";
+  m.style.borderColor = bad ? "var(--magpie-red, #c53030)" : "";
+}
+
+let busy = false;
+async function invoke(method, params, opts) {
+  const r = await api().invoke(method, params || {}, opts);
+  if (r && r.cancelled) throw new Error("已取消");
+  return r;
+}
+
+function fmtAt(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleString();
+}
+
+function renderJob(job) {
+  const box = $("job");
+  box.replaceChildren();
+  $("job-state").textContent = job?.state || "无";
+  $("stop").disabled = !job || job.state !== "running";
+  if (!job) {
+    box.className = "wb-empty";
+    box.textContent = "还没有运行过任务。";
+    return;
   }
-
-  // ---- 主题 ------------------------------------------------------------------
-
-  function normalizeTheme(t) {
-    if (typeof t === "string") return t;
-    if (t && typeof t === "object") {
-      // magpie 的窗口主题形状是 { dark: bool, lang, tokens }；先认这个官方形状
-      if (typeof t.dark === "boolean") return t.dark ? "dark" : "light";
-      if (typeof t.theme === "string") return t.theme;
-      if (typeof t.value === "string") return t.value;
-      if (typeof t.mode === "string") return t.mode;
+  box.className = "wb-job";
+  const tot = job.totals || {};
+  const line = el("div", "wb-job-line");
+  line.append(el("span", "", `job ${job.id} · ${job.state}`), el("span", "", `+${tot.credit || 0} 积分 · +${tot.energy || 0} 能量`));
+  box.append(line);
+  if (job.startedAt) box.append(el("div", "wb-job-line", `${fmtAt(job.startedAt)} 起${job.endedAt ? `，${fmtAt(job.endedAt)} 结束` : ""}`));
+  const steps = Array.isArray(job.steps) ? job.steps.slice(-12) : [];
+  if (steps.length) {
+    const ul = el("ul", "wb-steps");
+    for (const s of steps) {
+      const li = el("li");
+      const mark = s.state === "ok" ? "✓" : s.state === "fail" ? "✗" : s.state === "skip" ? "－" : "…";
+      li.append(el("span", s.state === "ok" ? "wb-ok" : s.state === "fail" ? "wb-fail" : s.state === "skip" ? "wb-skip" : "", mark),
+        el("span", "wb-task-title", `${s.nickname || s.uid || ""} ${s.leg || ""}`),
+        el("span", "wb-task-state", s.detail || s.state || ""));
+      ul.append(li);
     }
-    return "";
+    box.append(ul);
   }
+  const logs = Array.isArray(job.log) ? job.log.slice(-2) : [];
+  for (const l of logs) box.append(el("div", "wb-task-state", l));
+}
 
-  function applyTheme(t) {
-    var mode = normalizeTheme(t);
-    var root = document.documentElement;
-    if (mode === "dark" || mode === "light") root.setAttribute("data-theme", mode);
-    else root.removeAttribute("data-theme"); // 跟随系统（CSS prefers-color-scheme 兜底）
-  }
-
-  // ---- 看板地址 ----------------------------------------------------------------
-
-  function hostOf(url) {
+function claimButton(uid, code) {
+  const b = el("button", "wb-btn", "领奖");
+  b.type = "button";
+  b.addEventListener("click", async () => {
+    b.disabled = true;
     try {
-      return new URL(url).hostname;
+      await invoke("claim", { uid, code });
+      await load();
     } catch (e) {
-      return "";
+      say(String(e.message || e), true);
+      b.disabled = false;
     }
-  }
+  });
+  return b;
+}
 
-  function isLoopbackHost(h) {
-    return h === "127.0.0.1" || h === "localhost" || h === "[::1]" || h === "::1";
+function renderAccounts(accounts) {
+  const box = $("accounts");
+  box.replaceChildren();
+  if (!Array.isArray(accounts) || !accounts.length) {
+    box.className = "wb-empty";
+    box.textContent = "没有可用的 WorkBuddy 国内版账号。先在 magpie 里登录。";
+    return;
   }
-
-  // 页面被 magpie 以 /_magpie/plugin/<token>/ 的形式服务在 magpie 自己的主机上，
-  // 所以 location.hostname 就是用户访问 magpie 用的地址：用 192.0.2.10 打开
-  // magpie，看板地址就是 http://192.0.2.10:4390，不再死写 127.0.0.1。
-  // 沙箱虽是无同源（opaque origin），仍可读取自身 location。
-  function derivedDashboardUrl() {
-    var h = "";
-    try {
-      h = location.hostname || "";
-    } catch (e) { h = ""; }
-    if (!h || h === "0.0.0.0" || h === "::") return "";
-    return "http://" + h + ":" + DASH_PORT;
-  }
-
-  // 地址选择顺序：
-  //   ① dashboardUrl 显式设置且不是回环地址 → 用它（运维声明的对外地址）
-  //   ② 从 magpie 访问主机推导出的地址（局域网/网关 IP 场景，用户要的口径）
-  //   ③ dashboardUrl 显式设置的回环地址（SSH 隧道场景，可能带自定义端口）
-  //   ④ 推导出的回环地址 / 最终兜底 127.0.0.1:4390
-  function resolveDashboardUrl(raw) {
-    var opt = typeof raw === "string" ? raw.trim() : "";
-    var hasOpt = /^https?:\/\//i.test(opt);
-    var derived = derivedDashboardUrl();
-    if (hasOpt && !isLoopbackHost(hostOf(opt))) return opt;
-    if (derived && !isLoopbackHost(hostOf(derived))) return derived;
-    if (hasOpt) return opt;
-    return derived || DEFAULT_URL;
-  }
-
-  function setDashboardUrl(raw) {
-    var url = resolveDashboardUrl(raw);
-    var code = $("#dashUrl");
-    var link = $("#dashLink");
-    if (code) code.textContent = url;
-    if (link) link.setAttribute("href", url);
-    updateTunnelHint(url);
-  }
-
-  // dashboardUrl 写的是回环地址（127.0.0.1/localhost/::1）时提示 SSH 隧道用法：
-  // 隧道映射后仍可用 127.0.0.1:<port> 打开，无需改选项。非回环地址或解析失败
-  // 一律静默隐藏，不炸页面（沙箱页零网络、零报错的纪律不变）。
-  function updateTunnelHint(url) {
-    var hint = $("#tunnelHint");
-    if (!hint) return;
-    var port = "";
-    try {
-      var u = new URL(url);
-      var h = u.hostname;
-      if (h === "127.0.0.1" || h === "localhost" || h === "[::1]" || h === "::1") {
-        port = u.port || (u.protocol === "https:" ? "443" : "80");
+  box.className = "";
+  for (const a of accounts) {
+    const acct = el("div", "wb-acct");
+    const head = el("div", "wb-acct-head");
+    head.append(el("span", "wb-name", a.nickname || a.uid), el("span", "wb-task-state", a.tasksEnabled ? "参与任务" : "已停用"));
+    acct.append(head);
+    const tasks = a.snapshot && Array.isArray(a.snapshot.tasks) ? a.snapshot.tasks : [];
+    const shown = tasks.filter((t) => t.acceptStatus === "completed" || t.acceptStatus === "accepted" || t.acceptStatus === "not_accepted").slice(0, 12);
+    if (shown.length) {
+      const ul = el("ul", "wb-tasks");
+      for (const t of shown) {
+        const li = el("li");
+        const prog = t.progress && t.progress.target ? `${t.progress.current}/${t.progress.target}` : "";
+        const state = t.acceptStatus === "completed" ? "可领奖" : t.acceptStatus === "claimed" ? "已领奖" : t.acceptStatus === "accepted" ? "进行中" : "未接取";
+        li.append(el("span", "wb-task-title", `${t.title || t.code}${prog ? ` · ${prog}` : ""}`), el("span", "wb-task-state", state));
+        if (t.acceptStatus === "completed") li.append(claimButton(a.uid, t.code));
+        ul.append(li);
       }
-    } catch (e) { port = ""; }
-    if (!port) {
-      hint.hidden = true;
-      return;
+      acct.append(ul);
+    } else {
+      acct.append(el("div", "wb-task-state", "暂无任务快照，运行一轮后会刷新。"));
     }
-    var code = $("#tunnelUrl");
-    if (code) code.textContent = "127.0.0.1:" + port;
-    hint.hidden = false;
+    box.append(acct);
+  }
+}
+
+function render(s) {
+  const accounts = Array.isArray(s?.accounts) ? s.accounts : [];
+  $("accounts-count").textContent = `${accounts.length} 个`;
+  const st = s?.stats || {};
+  $("credits").textContent = String(st.creditsToday || 0);
+  $("energy").textContent = String(st.energyToday || 0);
+  const sc = s?.scheduler || {};
+  $("scheduler").textContent = sc.enabled ? "开" : "关";
+  $("sched").checked = !!sc.enabled;
+  $("claim").checked = sc.claim !== false;
+  renderJob(s?.job || null);
+  renderAccounts(accounts);
+  if (Array.isArray(s?.engineErrors) && s.engineErrors.length) say(`引擎提示：${s.engineErrors.join("；")}`, true);
+}
+
+async function load() {
+  if (busy) return;
+  busy = true;
+  try {
+    const s = await invoke("status");
+    render(s);
+  } catch (e) {
+    say(`读取状态失败：${e.message || e}`, true);
+  } finally {
+    busy = false;
+  }
+}
+
+async function act(button, fn) {
+  if (button) button.disabled = true;
+  try {
+    await fn();
+    await load();
+  } catch (e) {
+    say(String(e.message || e), true);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+window.addEventListener("DOMContentLoaded", async () => {
+  try {
+    await api().ready;
+  } catch (e) {
+    say(`页面初始化失败：${e.message || e}`, true);
+    return;
   }
 
-  // ---- 复制（clipboard API 在沙箱里可能被拒 → execCommand 兜底） ------------------
+  $("refresh").addEventListener("click", () => act($("refresh"), () => invoke("refresh")));
+  $("run").addEventListener("click", () => act($("run"), () => invoke("run", { legs: ["growth", "mp", "buddy", "travel", "night"], claim: true })));
+  $("stop").addEventListener("click", () => act($("stop"), () => invoke("cancel")));
+  $("sched").addEventListener("change", (e) => act(null, () => invoke("settings", { scheduler: e.target.checked })));
+  $("claim").addEventListener("change", (e) => act(null, () => invoke("settings", { claim: e.target.checked })));
 
-  function showToast(msg, ok) {
-    var dash = document.querySelector(".wb-dash");
-    if (!dash) return;
-    var old = dash.querySelector(".wb-toast");
-    if (old) old.remove();
-    var p = document.createElement("p");
-    p.className = ok ? "wb-toast wb-toast-ok" : "wb-toast";
-    p.textContent = msg; // 只走 textContent，无注入面
-    dash.appendChild(p);
-    setTimeout(function () {
-      p.remove();
-    }, 3200);
-  }
-
-  function copyText(text, done) {
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(
-          function () { done(true); },
-          function () { done(fallbackCopy(text)); },
-        );
-        return;
-      }
-    } catch (e) { /* 落到兜底 */ }
-    done(fallbackCopy(text));
-  }
-
-  function currentUrl() {
-    var code = $("#dashUrl");
-    return code ? code.textContent : DEFAULT_URL;
-  }
-
-  function copyDashboardUrl() {
-    var text = currentUrl();
-    copyText(text, function (ok) {
-      showToast(ok ? "已复制：" + text : "复制被沙箱拒绝，请手动选中地址复制。", ok);
-    });
-  }
-
-  // magpie 的 iframe 只有 sandbox="allow-scripts"，没有 allow-popups：
-  // window.open / target="_blank" 会被浏览器静默拦掉。这里先诚实地试一次，
-  // 被拦就把地址复制好并给出下一步——绝不让点击「没反应」。
-  // 右键链接 →「在新标签页中打开」不受脚本弹窗限制，是另一条可靠路径。
-  function openDashboard(e) {
-    if (e) e.preventDefault();
-    var url = currentUrl();
-    var win = null;
-    try {
-      win = window.open(url, "_blank", "noopener,noreferrer");
-    } catch (err) {
-      win = null;
-    }
-    if (win) {
-      showToast("已在新窗口打开看板。", true);
-      return;
-    }
-    copyText(url, function (ok) {
-      showToast(
-        ok
-          ? "magpie 沙箱不允许弹新窗口：地址已复制，粘贴到浏览器新标签页即可；也可右键「打开看板」→ 在新标签页中打开。"
-          : "magpie 沙箱不允许弹新窗口：请复制上方地址，或右键「打开看板」→ 在新标签页中打开。",
-        ok,
-      );
-    });
-  }
-
-  function fallbackCopy(text) {
-    try {
-      var ta = document.createElement("textarea");
-      ta.value = text;
-      ta.setAttribute("style", "position:fixed;top:0;left:0;opacity:0");
-      document.body.appendChild(ta);
-      ta.select();
-      var ok = document.execCommand("copy");
-      ta.remove();
-      return ok;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  // ---- 宿主桥接（防御式：任何 API 缺失都不炸页面） --------------------------------
-
-  function consumeHost(mp) {
-    if (!mp || typeof mp !== "object") return;
-
-    // 初始主题
-    try {
-      var t = typeof mp.theme === "function" ? mp.theme() : mp.theme;
-      if (t != null) applyTheme(t);
-    } catch (e) {}
-
-    // 主题变化
-    try {
-      if (typeof mp.onTheme === "function") mp.onTheme(applyTheme);
-    } catch (e) {}
-
-    // 插件选项（dashboardUrl；声明默认值见 package.json 的 magpie.options）。
-    // 选项为空字符串时也调用一次：setDashboardUrl("") 会按当前 magpie 访问主机重算。
-    try {
-      if (mp.options && typeof mp.options.get === "function") {
-        Promise.resolve(mp.options.get()).then(
-          function (opts) {
-            setDashboardUrl(opts && typeof opts.dashboardUrl === "string" ? opts.dashboardUrl : "");
-          },
-          function () {},
-        );
-      }
-    } catch (e) {}
-
-    // onAction：宿主动作回调。本卡没有需要响应的宿主动作，注册一个安全的空实现，
-    // 避免宿主在缺少 handler 时报错；不做任何越权 RPC。
-    try {
-      if (typeof mp.onAction === "function") {
-        mp.onAction(function () {
-          /* no-op：入口卡无宿主动作 */
-        });
-      }
-    } catch (e) {}
-
-    // 注意：magpie.read('providers:list' | 'usage:summary') 一律不调用 ——
-    // package.json 的 magpie.permissions 为空，未申报任何读取权限。
-  }
-
-  function waitForHost(tries) {
-    var mp = window.magpie;
-    if (mp) {
-      consumeHost(mp);
-      return;
-    }
-    if (tries <= 0) return; // 宿主桥始终没出现：静态入口卡照常可用
-    setTimeout(function () {
-      waitForHost(tries - 1);
-    }, 120);
-  }
-
-  function start() {
-    setDashboardUrl(""); // 先按当前访问 magpie 的主机落一版，宿主选项到达后再覆盖
-    var copyBtn = $("#copyBtn");
-    if (copyBtn) copyBtn.addEventListener("click", copyDashboardUrl);
-    var openLink = $("#dashLink");
-    if (openLink) openLink.addEventListener("click", openDashboard);
-
-    var mp = window.magpie;
-    var ready = mp ? mp.ready : null;
-    if (mp && (typeof ready === "function" || (ready && typeof ready.then === "function"))) {
-      // magpie.ready 是 Promise（见 _magpie/bridge.js 契约），不是回调式 API。
-      // 加载 bridge.js + await ready 就是「跟 magpie 说上话」：少了这一步，宿主
-      // 10 秒内收不到消息，会把本卡标成「已停止工作」。
-      try {
-        var r = typeof ready === "function" ? ready() : ready;
-        Promise.resolve(r).then(
-          function (theme) {
-            applyTheme(theme);
-            consumeHost(mp);
-          },
-          function () {
-            consumeHost(mp);
-          },
-        );
-        return;
-      } catch (e) {
-        consumeHost(mp);
-        return;
-      }
-    }
-    waitForHost(25); // 桥可能稍后注入
-  }
-
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
-  else start();
-})();
+  await load();
+  // a job's steps change on the engine's tick: poll while one runs, slowly otherwise
+  setInterval(() => {
+    if (document.hidden || busy) return;
+    const running = $("job-state").textContent === "running";
+    if (running) load();
+  }, 2000);
+  setInterval(() => { if (!document.hidden && !busy && $("job-state").textContent !== "running") load(); }, 15000);
+});

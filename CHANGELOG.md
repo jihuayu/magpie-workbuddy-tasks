@@ -1,5 +1,19 @@
 # 更新日志
 
+## 0.4.0 — 2026-11-09
+
+### 变更
+
+- **引擎移入 magpie 插件宿主**：不再 spawn `daemon.mjs`，不再监听 4390，也没有独立看板地址。插件入口启动一个进程内引擎（随机回环端口，只给本进程的页面/工具用），随宿主退出。
+- **页面用 `magpie.invoke` 直接调动作**：`status / run / job / cancel / claim / settings / refresh`，`run / claim / cancel` 走宿主的一次性确认；页面不再是跳转看板的入口卡，状态、任务、账号和按钮都在插件页里。
+- **进程内 API 加认证**：随机 Bearer key 只存在内存，`/api/*` 无 key 一律 401，`daemon.json` 不再写 key/端口；本机其它进程即使扫到随机端口也读不到导出等含凭据的响应。
+- 排程仍可用：只驱动 job 收尾和小时排程检查，不跑 magpie/control 探测，避免在宿主进程内被误判退出。
+- 0.3.x 的 `daemon.mjs` 保留给旧测试/手动调试，但插件入口不再使用；`dashboardUrl` / `listenAddress` 选项保留但忽略。
+
+### 测试
+
+- 进程内冒烟：动作表、`status`、`settings`、无账号时 `run` 的报错；`startDaemon(requireKey)` 无 key 401 / 带 key 200；`runner` 与沙箱卫生测试 15 项全绿。
+
 ## 0.3.2 — 2026-11-07
 
 ### 新增

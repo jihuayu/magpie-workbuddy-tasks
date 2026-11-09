@@ -642,6 +642,9 @@ export async function startDaemon(opts = {}) {
   // key 只落 daemon.json（0600，向后兼容保留的字段：index.mjs/lifecycle 的探测
   // 逻辑与老看板会读它），不是访问凭据 —— 免密钥口径下任何接口都不校验它。
   const key = opts.key || args.key || process.env.WB_DAEMON_KEY || readDaemonInfo(stateDir)?.key || crypto.randomBytes(24).toString("base64url")
+  // 嵌入宿主时（index.mjs）用一个只存在内存里的 key：本机其它进程即使找到
+  // 随机端口，也读不到 /api/accounts/export 这类含凭据的响应。
+  const requireKey = opts.requireKey === true
 
   // ---- 引擎 ----
   const engine = opts.engine ?? (await loadEngine(log))
@@ -2182,6 +2185,10 @@ export async function startDaemon(opts = {}) {
       return
     }
     try {
+      if (requireKey && u.pathname.startsWith("/api/") && req.headers.authorization !== `Bearer ${key}`) {
+        json(res, 401, { error: "unauthorized" })
+        return
+      }
       if (u.pathname.startsWith("/api/")) await handleApi(req, res, u)
       else serveStatic(req, res, u.pathname)
     } catch (e) {
@@ -2234,7 +2241,7 @@ export async function startDaemon(opts = {}) {
 
   function heartbeat() {
     // host 一并落盘：index.mjs 的宿主日志与 /api/state 由此读出真实绑定地址（A）
-    writeDaemonInfo(stateDir, { pid: process.pid, port, key, version: VERSION, startedAt, host })
+    if (opts.noInfo !== true) writeDaemonInfo(stateDir, { pid: process.pid, port, key, version: VERSION, startedAt, host })
     try {
       writeFileSync(join(stateDir, "daemon.heartbeat"), String(now()), "utf8")
     } catch {}
